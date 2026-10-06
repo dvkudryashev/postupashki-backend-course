@@ -22,7 +22,7 @@ func (wg *WaitGroup) Add(delta int) {
 		}
 
 		if atomic.CompareAndSwapUint32(&wg.count, current, uint32(newValue)) {
-			if newValue == 0 {
+			if current != 0 && newValue == 0 {
 				futex.WakeAll(&wg.count)
 			}
 			return

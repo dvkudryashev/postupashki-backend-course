@@ -6,14 +6,15 @@ import (
 )
 
 const (
-	free   = 0
-	writer = 1 << 31
+	free   uint32 = 0
+	writer uint32 = 1 << 31
 )
 
 type RWMutex struct {
-	state          uint32
-	waitingWriters atomic.Int32
-	waitersCnt     atomic.Int32
+	state            uint32
+	waitingWriters   uint32
+	waitersCnt       atomic.Int32
+	readerWaitersCnt atomic.Int32
 }
 
 func (rw *RWMutex) RLock() {
@@ -27,14 +28,9 @@ func (rw *RWMutex) RLock() {
 			continue
 		}
 
-		if rw.waitingWriters.Load() > 0 {
-			if currentState == free {
-				continue
-			}
-
-			rw.waitersCnt.Add(1)
-			futex.Wait(&rw.state, currentState)
-			rw.waitersCnt.Add(-1)
+		currentWaitingWriters := atomic.LoadUint32(&rw.waitingWriters)
+		if currentWaitingWriters > 0 {
+			rw.waitForWriters(currentWaitingWriters)
 			continue
 		}
 
@@ -48,6 +44,12 @@ func (rw *RWMutex) RLock() {
 	}
 }
 
+func (rw *RWMutex) waitForWriters(currentWaitingWriters uint32) {
+	rw.readerWaitersCnt.Add(1)
+	futex.Wait(&rw.waitingWriters, currentWaitingWriters)
+	rw.readerWaitersCnt.Add(-1)
+}
+
 func (rw *RWMutex) RUnlock() {
 	for {
 		currentState := atomic.LoadUint32(&rw.state)
@@ -58,44 +60,36 @@ func (rw *RWMutex) RUnlock() {
 			panic("tried to unlock writer's lock")
 		case currentState > 0 && currentState < writer:
 			if atomic.CompareAndSwapUint32(&rw.state, currentState, currentState-1) {
-				if currentState > 1 {
-					return
+				if currentState == 1 && rw.waitersCnt.Load() > 0 {
+					futex.WakeAll(&rw.state)
 				}
-				if currentState == 1 {
-					if rw.waitersCnt.Load() > 0 {
-						futex.WakeAll(&rw.state)
-					}
-					return
-				}
+				return
 			}
 		default:
-			panic("unexpected behavior")
+			panic("unexpected rwmutex state")
 		}
 	}
 }
 
 func (rw *RWMutex) Lock() {
-	enqueued := false
+	if atomic.CompareAndSwapUint32(&rw.state, free, writer) {
+		return
+	}
+
+	atomic.AddUint32(&rw.waitingWriters, 1)
+
 	for {
 		currentState := atomic.LoadUint32(&rw.state)
 		if currentState == free {
 			if atomic.CompareAndSwapUint32(&rw.state, free, writer) {
-				if enqueued {
-					rw.waitingWriters.Add(-1)
+				if atomic.AddUint32(&rw.waitingWriters, ^uint32(0)) == 0 && rw.readerWaitersCnt.Load() > 0 {
+					futex.WakeAll(&rw.waitingWriters)
 				}
 				return
 			}
-			if !enqueued {
-				rw.waitingWriters.Add(1)
-				enqueued = true
-			}
 			continue
 		}
-		if !enqueued {
-			rw.waitingWriters.Add(1)
-			enqueued = true
-			continue
-		}
+
 		rw.waitersCnt.Add(1)
 		futex.Wait(&rw.state, currentState)
 		rw.waitersCnt.Add(-1)

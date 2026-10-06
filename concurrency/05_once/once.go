@@ -10,7 +10,7 @@ type Once struct {
 }
 
 const (
-	idle = iota
+	idle uint32 = iota
 	running
 	done
 )

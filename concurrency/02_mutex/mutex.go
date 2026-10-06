@@ -6,7 +6,7 @@ import (
 )
 
 const (
-	free = iota
+	free uint32 = iota
 	held
 	contended
 )
