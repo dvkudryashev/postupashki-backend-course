@@ -1,6 +1,7 @@
 package rwmutex
 
 import (
+	"primitives/02_mutex"
 	"primitives/internal/futex"
 	"sync/atomic"
 )
@@ -10,98 +11,121 @@ const (
 	writer uint32 = 1 << 31
 )
 
+const maxReaders uint32 = writer - 1
+
 type RWMutex struct {
-	state            uint32
-	waitingWriters   uint32
-	waitersCnt       atomic.Int32
-	readerWaitersCnt atomic.Int32
+	state          uint32
+	guard          mutex.Mutex
+	waitingReaders uint32
+	waitingWriters uint32
+	readerRound    uint32
 }
 
-func (rw *RWMutex) RLock() {
-	for {
-		currentState := atomic.LoadUint32(&rw.state)
+func (rw *RWMutex) registerReader() (currentRound uint32, shouldWait bool) {
+	rw.guard.Lock()
+	defer rw.guard.Unlock()
 
-		if currentState == writer {
-			rw.waitersCnt.Add(1)
-			futex.Wait(&rw.state, currentState)
-			rw.waitersCnt.Add(-1)
-			continue
-		}
-
-		currentWaitingWriters := atomic.LoadUint32(&rw.waitingWriters)
-		if currentWaitingWriters > 0 {
-			rw.waitForWriters(currentWaitingWriters)
-			continue
-		}
-
-		if currentState == writer-1 {
+	currentState := atomic.LoadUint32(&rw.state)
+	if currentState != writer && rw.waitingWriters == 0 {
+		if currentState >= maxReaders {
 			panic("reader count overflow")
 		}
 
-		if atomic.CompareAndSwapUint32(&rw.state, currentState, currentState+1) {
-			return
-		}
+		atomic.StoreUint32(&rw.state, currentState+1)
+		return 0, false
+	}
+
+	if rw.waitingReaders >= maxReaders {
+		panic("waiting reader count overflow")
+	}
+
+	currentRound = atomic.LoadUint32(&rw.readerRound)
+	rw.waitingReaders++
+	return currentRound, true
+}
+
+func (rw *RWMutex) RLock() {
+	currentRound, shouldWait := rw.registerReader()
+	if shouldWait {
+		rw.waitForReaders(currentRound)
 	}
 }
 
-func (rw *RWMutex) waitForWriters(currentWaitingWriters uint32) {
-	rw.readerWaitersCnt.Add(1)
-	futex.Wait(&rw.waitingWriters, currentWaitingWriters)
-	rw.readerWaitersCnt.Add(-1)
+func (rw *RWMutex) waitForReaders(currentRound uint32) {
+	for atomic.LoadUint32(&rw.readerRound) == currentRound {
+		futex.Wait(&rw.readerRound, currentRound)
+	}
 }
 
 func (rw *RWMutex) RUnlock() {
-	for {
-		currentState := atomic.LoadUint32(&rw.state)
-		switch {
-		case currentState == free:
-			panic("tried to unlock unlocked")
-		case currentState == writer:
-			panic("tried to unlock writer's lock")
-		case currentState > 0 && currentState < writer:
-			if atomic.CompareAndSwapUint32(&rw.state, currentState, currentState-1) {
-				if currentState == 1 && rw.waitersCnt.Load() > 0 {
-					futex.WakeAll(&rw.state)
-				}
-				return
-			}
-		default:
-			panic("unexpected rwmutex state")
-		}
+	rw.guard.Lock()
+
+	currentState := atomic.LoadUint32(&rw.state)
+	if currentState >= writer {
+		rw.guard.Unlock()
+		panic("tried to unlock writer's lock")
+	}
+	if currentState == free {
+		rw.guard.Unlock()
+		panic("tried to unlock unlocked")
+	}
+
+	newValue := currentState - 1
+	atomic.StoreUint32(&rw.state, newValue)
+	wakeWriter := newValue == free && rw.waitingWriters > 0
+
+	rw.guard.Unlock()
+
+	if wakeWriter {
+		futex.Wake(&rw.state)
 	}
 }
 
 func (rw *RWMutex) Lock() {
-	if atomic.CompareAndSwapUint32(&rw.state, free, writer) {
-		return
+	rw.guard.Lock()
+
+	if rw.waitingWriters == ^uint32(0) {
+		rw.guard.Unlock()
+		panic("waiting writer count overflow")
 	}
+	rw.waitingWriters++
 
-	atomic.AddUint32(&rw.waitingWriters, 1)
-
-	for {
-		currentState := atomic.LoadUint32(&rw.state)
-		if currentState == free {
-			if atomic.CompareAndSwapUint32(&rw.state, free, writer) {
-				if atomic.AddUint32(&rw.waitingWriters, ^uint32(0)) == 0 && rw.readerWaitersCnt.Load() > 0 {
-					futex.WakeAll(&rw.waitingWriters)
-				}
-				return
-			}
-			continue
-		}
-
-		rw.waitersCnt.Add(1)
+	currentState := atomic.LoadUint32(&rw.state)
+	for currentState != free {
+		rw.guard.Unlock()
 		futex.Wait(&rw.state, currentState)
-		rw.waitersCnt.Add(-1)
+		rw.guard.Lock()
+		currentState = atomic.LoadUint32(&rw.state)
 	}
+
+	rw.waitingWriters--
+	atomic.StoreUint32(&rw.state, writer)
+
+	rw.guard.Unlock()
 }
 
 func (rw *RWMutex) Unlock() {
-	if atomic.CompareAndSwapUint32(&rw.state, writer, free) {
-		if rw.waitersCnt.Load() > 0 {
-			futex.WakeAll(&rw.state)
-		}
-		return
+	rw.guard.Lock()
+
+	if atomic.LoadUint32(&rw.state) != writer {
+		rw.guard.Unlock()
+		panic("tried to unlock non-writer's lock")
 	}
-	panic("tried to unlock non-writer's lock")
+
+	readersToWake := rw.waitingReaders
+	rw.waitingReaders = 0
+	atomic.StoreUint32(&rw.state, readersToWake)
+	wakeWriter := readersToWake == 0 && rw.waitingWriters > 0
+
+	if readersToWake > 0 {
+		atomic.AddUint32(&rw.readerRound, 1)
+	}
+
+	rw.guard.Unlock()
+
+	if readersToWake > 0 {
+		futex.WakeAll(&rw.readerRound)
+	} else if wakeWriter {
+		futex.Wake(&rw.state)
+	}
 }
