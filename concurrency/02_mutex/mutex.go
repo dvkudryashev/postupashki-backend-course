@@ -1,7 +1,12 @@
 package mutex
 
+import (
+	"primitives/internal/futex"
+	"sync/atomic"
+)
+
 const (
-	free = iota
+	free uint32 = iota
 	held
 	contended
 )
@@ -11,13 +16,28 @@ type Mutex struct {
 }
 
 func (m *Mutex) Lock() {
-	panic("не реализовано")
+	if atomic.CompareAndSwapUint32(&m.state, free, held) {
+		return
+	}
+
+	for atomic.SwapUint32(&m.state, contended) != free {
+		futex.Wait(&m.state, contended)
+	}
 }
 
 func (m *Mutex) TryLock() bool {
-	panic("не реализовано")
+	return atomic.CompareAndSwapUint32(&m.state, free, held)
 }
 
 func (m *Mutex) Unlock() {
-	panic("не реализовано")
+	switch atomic.SwapUint32(&m.state, free) {
+	case free:
+		panic("tried to unlock free mutex")
+	case held:
+		return
+	case contended:
+		futex.Wake(&m.state)
+	default:
+		panic("unexpected mutex state")
+	}
 }

@@ -1,5 +1,10 @@
 package barrier
 
+import (
+	"primitives/internal/futex"
+	"sync/atomic"
+)
+
 type Barrier struct {
 	need    uint32
 	arrived uint32
@@ -7,9 +12,34 @@ type Barrier struct {
 }
 
 func New(n int) *Barrier {
-	panic("не реализовано")
+	if n <= 0 {
+		panic("barrier size must be positive")
+	}
+
+	if int64(n) > int64(^uint32(0)) {
+		panic("uint32 overflow")
+	}
+
+	return &Barrier{
+		need: uint32(n),
+	}
 }
 
 func (b *Barrier) Wait() {
-	panic("не реализовано")
+	currentRound := atomic.LoadUint32(&b.round)
+	newArrived := atomic.AddUint32(&b.arrived, 1)
+
+	if newArrived == b.need {
+		atomic.StoreUint32(&b.arrived, 0)
+		atomic.AddUint32(&b.round, 1)
+		futex.WakeAll(&b.round)
+		return
+	}
+
+	for {
+		if atomic.LoadUint32(&b.round) != currentRound {
+			return
+		}
+		futex.Wait(&b.round, currentRound)
+	}
 }
