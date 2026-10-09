@@ -45,6 +45,50 @@ const (
 	FlagURG uint8 = 1 << 5
 )
 
+type EthernetInfo struct {
+	Src       [6]byte
+	Dst       [6]byte
+	EtherType EtherType
+}
+
+type IPv4Info struct {
+	Version             uint8
+	TTL                 uint8
+	Protocol            uint8
+	IHLBytes            int
+	TotalLength         int
+	ID                  uint16
+	Flags               uint16
+	FragmentOffsetBytes uint16
+	Src                 [4]byte
+	Dst                 [4]byte
+	ChecksumValid       bool
+}
+
+type TCPInfo struct {
+	SrcPort         uint16
+	DstPort         uint16
+	Window          uint16
+	Seq             uint32
+	Ack             uint32
+	DataOffsetBytes int
+	Flags           uint8
+}
+
+type UDPInfo struct {
+	SrcPort uint16
+	DstPort uint16
+	Length  uint16
+}
+
+type Packet struct {
+	Ethernet      EthernetInfo
+	IPv4          *IPv4Info
+	TCP           *TCPInfo
+	UDP           *UDPInfo
+	PayloadLength int
+}
+
 func main() {
 	if err := run(os.Stdin, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -57,13 +101,109 @@ func run(in io.Reader, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if err := validatePacket(frame); err != nil {
+	packet, err := parseFrame(frame)
+	if err != nil {
 		return err
 	}
 
 	writer := bufio.NewWriter(out)
-	printPacket(writer, frame)
+	printPacket(writer, packet)
 	return writer.Flush()
+}
+
+func parseFrame(raw []byte) (Packet, error) {
+	if len(raw) < EthernetHeaderSize {
+		return Packet{}, fmt.Errorf("truncated Ethernet header: %d bytes", len(raw))
+	}
+
+	var packet Packet
+	packet.Ethernet.Dst = [6]byte(raw[0:6])
+	packet.Ethernet.Src = [6]byte(raw[6:12])
+	packet.Ethernet.EtherType = EtherType(binary.BigEndian.Uint16(raw[12:14]))
+
+	if packet.Ethernet.EtherType != EtherTypeIPv4 {
+		return packet, nil
+	}
+
+	ip := raw[EthernetHeaderSize:]
+
+	if len(ip) < IPv4HeaderSize {
+		return Packet{}, fmt.Errorf("truncated IPv4 header: %d bytes", len(ip))
+	}
+
+	version := ip[0] >> 4
+	if version != 4 {
+		return Packet{}, fmt.Errorf("invalid IPv4 version: %d", version)
+	}
+
+	ihlBytes := int(ip[0]&0x0f) * IPv4WordSize
+	if ihlBytes < IPv4HeaderSize || ihlBytes > len(ip) {
+		return Packet{}, fmt.Errorf("invalid IPv4 header length: %d", ihlBytes)
+	}
+
+	totalLength := int(binary.BigEndian.Uint16(ip[2:4]))
+	if totalLength < ihlBytes || totalLength > len(ip) {
+		return Packet{}, fmt.Errorf("invalid IPv4 total length: %d", totalLength)
+	}
+
+	ip = ip[:totalLength]
+
+	flagsAndOffset := binary.BigEndian.Uint16(ip[6:8])
+	packet.IPv4 = &IPv4Info{
+		Version:             version,
+		TTL:                 ip[8],
+		Protocol:            ip[9],
+		IHLBytes:            ihlBytes,
+		TotalLength:         totalLength,
+		ID:                  binary.BigEndian.Uint16(ip[4:6]),
+		Flags:               flagsAndOffset & (IPFlagDF | IPFlagMF),
+		FragmentOffsetBytes: parseIPOffset(flagsAndOffset),
+		Src:                 [4]byte(ip[12:16]),
+		Dst:                 [4]byte(ip[16:20]),
+		ChecksumValid:       ipChecksumValid(ip[:ihlBytes]),
+	}
+	packet.PayloadLength = totalLength - ihlBytes
+	if packet.IPv4.FragmentOffsetBytes != 0 {
+		return packet, nil
+	}
+
+	transport := ip[ihlBytes:]
+	switch packet.IPv4.Protocol {
+	case IPProtocolTCP:
+		if len(transport) < TCPHeaderSize {
+			return Packet{}, fmt.Errorf("truncated TCP header: %d bytes", len(transport))
+		}
+		dataOffsetBytes := int(transport[12]>>4) * IPv4WordSize
+		if dataOffsetBytes < TCPHeaderSize || dataOffsetBytes > len(transport) {
+			return Packet{}, fmt.Errorf("invalid TCP header length: %d", dataOffsetBytes)
+		}
+		packet.TCP = &TCPInfo{
+			SrcPort:         binary.BigEndian.Uint16(transport[0:2]),
+			DstPort:         binary.BigEndian.Uint16(transport[2:4]),
+			Window:          binary.BigEndian.Uint16(transport[14:16]),
+			Seq:             binary.BigEndian.Uint32(transport[4:8]),
+			Ack:             binary.BigEndian.Uint32(transport[8:12]),
+			DataOffsetBytes: dataOffsetBytes,
+			Flags:           transport[13],
+		}
+		packet.PayloadLength -= dataOffsetBytes
+
+	case IPProtocolUDP:
+		if len(transport) < UDPHeaderSize {
+			return Packet{}, fmt.Errorf("truncated UDP header: %d bytes", len(transport))
+		}
+		length := binary.BigEndian.Uint16(transport[4:6])
+		if length < UDPHeaderSize || (packet.IPv4.Flags&IPFlagMF == 0 && int(length) > len(transport)) {
+			return Packet{}, fmt.Errorf("invalid UDP length: %d", length)
+		}
+		packet.UDP = &UDPInfo{
+			SrcPort: binary.BigEndian.Uint16(transport[0:2]),
+			DstPort: binary.BigEndian.Uint16(transport[2:4]),
+			Length:  length,
+		}
+		packet.PayloadLength = min(int(length), len(transport)) - UDPHeaderSize
+	}
+	return packet, nil
 }
 
 func readFrame(in io.Reader) ([]byte, error) {
@@ -74,57 +214,6 @@ func readFrame(in io.Reader) ([]byte, error) {
 
 	dump := strings.ReplaceAll(strings.Join(strings.Fields(string(data)), ""), ":", "")
 	return hex.DecodeString(dump)
-}
-
-func validatePacket(frame []byte) error {
-	if len(frame) < EthernetHeaderSize {
-		return fmt.Errorf("truncated Ethernet header: %d bytes", len(frame))
-	}
-	if EtherType(binary.BigEndian.Uint16(frame[12:14])) != EtherTypeIPv4 {
-		return nil
-	}
-
-	ip := frame[EthernetHeaderSize:]
-	if len(ip) < IPv4HeaderSize {
-		return fmt.Errorf("truncated IPv4 header: %d bytes", len(ip))
-	}
-	if ip[0]>>4 != 4 {
-		return fmt.Errorf("invalid IPv4 version: %d", ip[0]>>4)
-	}
-	ihlBytes := int(ip[0]&0x0f) * IPv4WordSize
-	if ihlBytes < IPv4HeaderSize || ihlBytes > len(ip) {
-		return fmt.Errorf("invalid IPv4 header length: %d", ihlBytes)
-	}
-	totalLength := int(binary.BigEndian.Uint16(ip[2:4]))
-	if totalLength < ihlBytes || totalLength > len(ip) {
-		return fmt.Errorf("invalid IPv4 total length: %d", totalLength)
-	}
-	ip = ip[:totalLength]
-	flagsAndOffset := binary.BigEndian.Uint16(ip[6:8])
-	if flagsAndOffset&IPFragmentOffsetMask != 0 {
-		return nil
-	}
-
-	transport := ip[ihlBytes:]
-	switch ip[9] {
-	case IPProtocolTCP:
-		if len(transport) < TCPHeaderSize {
-			return fmt.Errorf("truncated TCP header: %d bytes", len(transport))
-		}
-		dataOffsetBytes := int(transport[12]>>4) * IPv4WordSize
-		if dataOffsetBytes < TCPHeaderSize || dataOffsetBytes > len(transport) {
-			return fmt.Errorf("invalid TCP header length: %d", dataOffsetBytes)
-		}
-	case IPProtocolUDP:
-		if len(transport) < UDPHeaderSize {
-			return fmt.Errorf("truncated UDP header: %d bytes", len(transport))
-		}
-		length := int(binary.BigEndian.Uint16(transport[4:6]))
-		if length < UDPHeaderSize || (flagsAndOffset&IPFlagMF == 0 && length > len(transport)) {
-			return fmt.Errorf("invalid UDP length: %d", length)
-		}
-	}
-	return nil
 }
 
 func formatMAC(data []byte) string {
@@ -224,79 +313,45 @@ func ipChecksumValid(header []byte) bool {
 	return ^uint16(sum) == storedChecksum
 }
 
-func printPacket(out io.Writer, frame []byte) {
-	dst := frame[0:6]
-	src := frame[6:12]
-	etherType := EtherType(binary.BigEndian.Uint16(frame[12:14]))
+func (e EthernetInfo) String() string {
+	return fmt.Sprintf("eth.dst %s\neth.src %s\neth.ethertype 0x%04x\n",
+		formatMAC(e.Dst[:]), formatMAC(e.Src[:]), e.EtherType)
+}
 
-	fmt.Fprintf(out, "eth.dst %s\n", formatMAC(dst))
-	fmt.Fprintf(out, "eth.src %s\n", formatMAC(src))
-	fmt.Fprintf(out, "eth.ethertype 0x%04x\n", etherType)
+func (ip IPv4Info) String() string {
+	return fmt.Sprintf("ip.version %d\nip.ihl_bytes %d\nip.total_length %d\nip.id 0x%04x\nip.flags %s\nip.frag_offset %d\nip.ttl %d\nip.protocol %d\nip.src %s\nip.dst %s\nip.checksum_valid %t\n",
+		ip.Version, ip.IHLBytes, ip.TotalLength, ip.ID, stringifyIPFlags(ip.Flags), ip.FragmentOffsetBytes,
+		ip.TTL, ip.Protocol, formatIPv4(ip.Src[:]), formatIPv4(ip.Dst[:]), ip.ChecksumValid)
+}
 
-	if etherType != EtherTypeIPv4 {
-		return
+func (tcp TCPInfo) String() string {
+	return fmt.Sprintf("tcp.src_port %d\ntcp.dst_port %d\ntcp.seq %d\ntcp.ack %d\ntcp.data_offset_bytes %d\ntcp.flags %s\ntcp.window %d\n",
+		tcp.SrcPort, tcp.DstPort, tcp.Seq, tcp.Ack, tcp.DataOffsetBytes, stringifyTCPFlags(tcp.Flags), tcp.Window)
+}
+
+func (udp UDPInfo) String() string {
+	return fmt.Sprintf("udp.src_port %d\nudp.dst_port %d\nudp.length %d\n", udp.SrcPort, udp.DstPort, udp.Length)
+}
+
+func (packet Packet) String() string {
+	var buffer strings.Builder
+	fmt.Fprint(&buffer, packet.Ethernet)
+
+	if packet.IPv4 == nil {
+		return buffer.String()
 	}
 
-	ip := frame[EthernetHeaderSize:]
-
-	version := ip[0] >> 4
-	ihlBytes := int(ip[0]&0x0f) * IPv4WordSize
-	totalLength := int(binary.BigEndian.Uint16(ip[2:4]))
-	ip = ip[:totalLength]
-	id := binary.BigEndian.Uint16(ip[4:6])
-	flagsAndOffset := binary.BigEndian.Uint16(ip[6:8])
-	protocol := ip[9]
-
-	fmt.Fprintf(out, "ip.version %d\n", version)
-	fmt.Fprintf(out, "ip.ihl_bytes %d\n", ihlBytes)
-	fmt.Fprintf(out, "ip.total_length %d\n", totalLength)
-	fmt.Fprintf(out, "ip.id 0x%04x\n", id)
-	fmt.Fprintf(out, "ip.flags %s\n", stringifyIPFlags(flagsAndOffset))
-	fmt.Fprintf(out, "ip.frag_offset %d\n", parseIPOffset(flagsAndOffset))
-	fmt.Fprintf(out, "ip.ttl %d\n", ip[8])
-	fmt.Fprintf(out, "ip.protocol %d\n", protocol)
-	fmt.Fprintf(out, "ip.src %s\n", formatIPv4(ip[12:16]))
-	fmt.Fprintf(out, "ip.dst %s\n", formatIPv4(ip[16:20]))
-	fmt.Fprintf(out, "ip.checksum_valid %t\n", ipChecksumValid(ip[:ihlBytes]))
-	if flagsAndOffset&IPFragmentOffsetMask != 0 {
-		fmt.Fprintf(out, "payload.length %d\n", totalLength-ihlBytes)
-		return
+	fmt.Fprint(&buffer, packet.IPv4)
+	if packet.TCP != nil {
+		fmt.Fprint(&buffer, packet.TCP)
 	}
-
-	switch protocol {
-	case IPProtocolTCP:
-		tcp := ip[ihlBytes:]
-
-		srcPort := binary.BigEndian.Uint16(tcp[0:2])
-		dstPort := binary.BigEndian.Uint16(tcp[2:4])
-		seq := binary.BigEndian.Uint32(tcp[4:8])
-		ack := binary.BigEndian.Uint32(tcp[8:12])
-		dataOffsetBytes := int(tcp[12]>>4) * IPv4WordSize
-		window := binary.BigEndian.Uint16(tcp[14:16])
-
-		fmt.Fprintf(out, "tcp.src_port %d\n", srcPort)
-		fmt.Fprintf(out, "tcp.dst_port %d\n", dstPort)
-		fmt.Fprintf(out, "tcp.seq %d\n", seq)
-		fmt.Fprintf(out, "tcp.ack %d\n", ack)
-		fmt.Fprintf(out, "tcp.data_offset_bytes %d\n", dataOffsetBytes)
-		fmt.Fprintf(out, "tcp.flags %s\n", stringifyTCPFlags(tcp[13]))
-		fmt.Fprintf(out, "tcp.window %d\n", window)
-		fmt.Fprintf(out, "payload.length %d\n", totalLength-ihlBytes-dataOffsetBytes)
-
-	case IPProtocolUDP:
-		udp := ip[ihlBytes:]
-
-		srcPort := binary.BigEndian.Uint16(udp[0:2])
-		dstPort := binary.BigEndian.Uint16(udp[2:4])
-		length := binary.BigEndian.Uint16(udp[4:6])
-
-		fmt.Fprintf(out, "udp.src_port %d\n", srcPort)
-		fmt.Fprintf(out, "udp.dst_port %d\n", dstPort)
-		fmt.Fprintf(out, "udp.length %d\n", length)
-		payloadLength := min(int(length), len(udp)) - UDPHeaderSize
-		fmt.Fprintf(out, "payload.length %d\n", payloadLength)
-
-	default:
-		fmt.Fprintf(out, "payload.length %d\n", totalLength-ihlBytes)
+	if packet.UDP != nil {
+		fmt.Fprint(&buffer, packet.UDP)
 	}
+	fmt.Fprintf(&buffer, "payload.length %d\n", packet.PayloadLength)
+	return buffer.String()
+}
+
+func printPacket(out io.Writer, packet Packet) {
+	fmt.Fprint(out, packet)
 }

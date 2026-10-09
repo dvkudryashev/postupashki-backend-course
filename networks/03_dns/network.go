@@ -5,12 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"time"
 )
 
 const (
-	dnsUDPBufferSize = 512
+	dnsUDPBufferSize = 65535
 	responseTimeout  = 5 * time.Second
 )
 
@@ -45,10 +44,7 @@ func receiveResponse(conn *net.UDPConn, requestID uint16, deadline time.Time) ([
 	for {
 		n, err := conn.Read(buffer)
 		if err != nil {
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				return nil, errTimeout
-			}
-			return nil, fmt.Errorf("read DNS response: %w", err)
+			return nil, errTimeout
 		}
 
 		if n < 2 {

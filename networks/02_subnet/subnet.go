@@ -5,7 +5,7 @@ import "net/netip"
 func calculateSubnet(prefix netip.Prefix) SubnetInfo {
 	bits := prefix.Bits()
 	mask := prefixMask(bits)
-	network := ipv4ToUint32(prefix.Addr()) & mask
+	network := ipv4ToUint32(prefix.Addr())
 	upper := network | ^mask
 	blockSize := uint64(1) << (32 - bits)
 
