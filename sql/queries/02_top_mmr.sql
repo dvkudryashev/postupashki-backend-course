@@ -5,3 +5,8 @@
 -- Порядок: mmr по убыванию, при равенстве nickname по возрастанию
 -- Строк:   15
 
+select nickname, country, mmr
+from players
+where mmr > '9000'
+order by mmr desc, nickname asc
+limit 15
