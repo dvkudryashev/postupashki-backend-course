@@ -5,3 +5,6 @@
 -- Порядок: name по возрастанию
 -- Строк:   11
 
+select hero_id, name, legs from heroes
+where primary_attr = 'str' and attack_type = 'melee'
+order by name asc;
